@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2018 The CallKeep Authors (see the AUTHORS file)
+ * Copyright (c) 2016-2019 The CallKeep Authors (see the AUTHORS file)
  * SPDX-License-Identifier: ISC, MIT
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -19,9 +19,13 @@ package io.wazo.callkeep;
 
 import android.annotation.TargetApi;
 import android.content.Intent;
+import android.content.Context;
+import android.content.ComponentName;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.speech.tts.Voice;
 import android.support.annotation.Nullable;
 import android.support.v4.content.LocalBroadcastManager;
 import android.telecom.CallAudioState;
@@ -33,6 +37,22 @@ import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
 import android.util.Log;
 
+import android.app.ActivityManager;
+import android.app.ActivityManager.RunningTaskInfo;
+
+import com.facebook.react.HeadlessJsTaskService;
+import com.facebook.react.bridge.ReactContext;
+import com.facebook.react.common.LifecycleState;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
 import static io.wazo.callkeep.RNCallKeepModule.ACTION_ANSWER_CALL;
 import static io.wazo.callkeep.RNCallKeepModule.ACTION_AUDIO_SESSION;
 import static io.wazo.callkeep.RNCallKeepModule.ACTION_DTMF_TONE;
@@ -42,51 +62,180 @@ import static io.wazo.callkeep.RNCallKeepModule.ACTION_MUTE_CALL;
 import static io.wazo.callkeep.RNCallKeepModule.ACTION_ONGOING_CALL;
 import static io.wazo.callkeep.RNCallKeepModule.ACTION_UNHOLD_CALL;
 import static io.wazo.callkeep.RNCallKeepModule.ACTION_UNMUTE_CALL;
+import static io.wazo.callkeep.RNCallKeepModule.ACTION_CHECK_REACHABILITY;
 import static io.wazo.callkeep.RNCallKeepModule.EXTRA_CALLER_NAME;
+import static io.wazo.callkeep.RNCallKeepModule.EXTRA_CALL_NUMBER;
+import static io.wazo.callkeep.RNCallKeepModule.EXTRA_CALL_UUID;
+import static io.wazo.callkeep.RNCallKeepModule.handle;
 
 // @see https://github.com/kbagchiGWC/voice-quickstart-android/blob/9a2aff7fbe0d0a5ae9457b48e9ad408740dfb968/exampleConnectionService/src/main/java/com/twilio/voice/examples/connectionservice/VoiceConnectionService.java
 @TargetApi(Build.VERSION_CODES.M)
 public class VoiceConnectionService extends ConnectionService {
-    private static Connection connection;
-    private static Boolean isAvailable = false;
-    private static final String TAG = "RNCallKeepModule";
+    private static Boolean isAvailable;
+    private static Boolean isInitialized;
+    private static Boolean isReachable;
+    private static String notReachableCallUuid;
+    private static ConnectionRequest currentConnectionRequest;
+    private static String TAG = "RNCK:VoiceConnectionService";
+    public static Map<String, VoiceConnection> currentConnections = new HashMap<>();
+    public static Boolean hasOutgoingCall = false;
+    public static VoiceConnectionService currentConnectionService = null;
 
-    public static Connection getConnection() {
-        return connection;
+    public static Connection getConnection(String connectionId) {
+        if (currentConnections.containsKey(connectionId)) {
+            return currentConnections.get(connectionId);
+        }
+        return null;
+    }
+
+    public VoiceConnectionService() {
+        super();
+        Log.e(TAG, "Constructor");
+        isReachable = false;
+        isInitialized = false;
+        isAvailable = false;
+        currentConnectionRequest = null;
+        currentConnectionService = this;
     }
 
     public static void setAvailable(Boolean value) {
+        Log.d(TAG, "setAvailable: " + (value ? "true" : "false"));
+        if (value) {
+            isInitialized = true;
+        }
+
         isAvailable = value;
     }
 
+    public static void setReachable() {
+        Log.d(TAG, "setReachable");
+        isReachable = true;
+        VoiceConnectionService.currentConnectionRequest = null;
+    }
 
-    public static void deinitConnection() {
-        Log.d(TAG, "deinitConnection");
-        connection = null;
+    public static void deinitConnection(String connectionId) {
+        Log.d(TAG, "deinitConnection:" + connectionId);
+        VoiceConnectionService.hasOutgoingCall = false;
+
+        if (currentConnections.containsKey(connectionId)) {
+            currentConnections.remove(connectionId);
+        }
     }
 
     @Override
     public Connection onCreateIncomingConnection(PhoneAccountHandle connectionManagerPhoneAccount, ConnectionRequest request) {
+        Bundle extra = request.getExtras();
+        Uri number = request.getAddress();
+        String name = extra.getString(EXTRA_CALLER_NAME);
         Connection incomingCallConnection = createConnection(request);
         incomingCallConnection.setRinging();
+        incomingCallConnection.setInitialized();
 
         return incomingCallConnection;
     }
 
     @Override
     public Connection onCreateOutgoingConnection(PhoneAccountHandle connectionManagerPhoneAccount, ConnectionRequest request) {
-        if (!this.canMakeOutgoingCall()) {
+        VoiceConnectionService.hasOutgoingCall = true;
+        String uuid = UUID.randomUUID().toString();
+
+        if (!isInitialized && !isReachable) {
+            this.notReachableCallUuid = uuid;
+            this.currentConnectionRequest = request;
+            this.checkReachability();
+        }
+
+        return this.makeOutgoingCall(request, uuid, false);
+    }
+
+    private Connection makeOutgoingCall(ConnectionRequest request, String uuid, Boolean forceWakeUp) {
+        Bundle extras = request.getExtras();
+        Connection outgoingCallConnection = null;
+        String number = request.getAddress().getSchemeSpecificPart();
+        String extrasNumber = extras.getString(EXTRA_CALL_NUMBER);
+        String displayName = extras.getString(EXTRA_CALLER_NAME);
+        Boolean isForeground = VoiceConnectionService.isRunning(this.getApplicationContext());
+
+        Log.d(TAG, "makeOutgoingCall:" + uuid + ", number: " + number + ", displayName:" + displayName);
+
+        // Wakeup application if needed
+        if (!isForeground || forceWakeUp) {
+            Log.d(TAG, "onCreateOutgoingConnection: Waking up application");
+            this.wakeUpApplication(uuid, number, displayName);
+        } else if (!this.canMakeOutgoingCall() && isReachable) {
+            Log.d(TAG, "onCreateOutgoingConnection: not available");
             return Connection.createFailedConnection(new DisconnectCause(DisconnectCause.LOCAL));
         }
 
-        Connection outgoingCallConnection = createConnection(request);
+        // TODO: Hold all other calls
+        if (extrasNumber == null || !extrasNumber.equals(number)) {
+            extras.putString(EXTRA_CALL_UUID, uuid);
+            extras.putString(EXTRA_CALLER_NAME, displayName);
+            extras.putString(EXTRA_CALL_NUMBER, number);
+        }
+
+        outgoingCallConnection = createConnection(request);
         outgoingCallConnection.setDialing();
         outgoingCallConnection.setAudioModeIsVoip(true);
+        outgoingCallConnection.setCallerDisplayName(displayName, TelecomManager.PRESENTATION_ALLOWED);
 
-        sendCallRequestToActivity(ACTION_ONGOING_CALL, request.getAddress().getSchemeSpecificPart());
+        // ‍️Weirdly on some Samsung phones (A50, S9...) using `setInitialized` will not display the native UI ...
+        // when making a call from the native Phone application. The call will still be displayed correctly without it.
+        if (!Build.MANUFACTURER.equalsIgnoreCase("Samsung")) {
+            outgoingCallConnection.setInitialized();
+        }
+
+        HashMap<String, String> extrasMap = this.bundleToMap(extras);
+
+        sendCallRequestToActivity(ACTION_ONGOING_CALL, extrasMap);
         sendCallRequestToActivity(ACTION_AUDIO_SESSION, null);
 
+        Log.d(TAG, "onCreateOutgoingConnection: calling");
+
         return outgoingCallConnection;
+    }
+
+    private void wakeUpApplication(String uuid, String number, String displayName) {
+        Intent headlessIntent = new Intent(
+            this.getApplicationContext(),
+            RNCallKeepBackgroundMessagingService.class
+        );
+        headlessIntent.putExtra("callUUID", uuid);
+        headlessIntent.putExtra("name", displayName);
+        headlessIntent.putExtra("handle", number);
+        Log.d(TAG, "wakeUpApplication: " + uuid + ", number : " + number + ", displayName:" + displayName);
+
+        ComponentName name = this.getApplicationContext().startService(headlessIntent);
+        if (name != null) {
+          HeadlessJsTaskService.acquireWakeLockNow(this.getApplicationContext());
+        }
+    }
+
+    private void wakeUpAfterReachabilityTimeout(ConnectionRequest request) {
+        if (this.currentConnectionRequest == null) {
+            return;
+        }
+        Log.d(TAG, "checkReachability timeout, force wakeup");
+        Bundle extras = request.getExtras();
+        String number = request.getAddress().getSchemeSpecificPart();
+        String displayName = extras.getString(EXTRA_CALLER_NAME);
+        wakeUpApplication(this.notReachableCallUuid, number, displayName);
+
+        VoiceConnectionService.currentConnectionRequest = null;
+    }
+
+    private void checkReachability() {
+        Log.d(TAG, "checkReachability");
+
+        final VoiceConnectionService instance = this;
+        sendCallRequestToActivity(ACTION_CHECK_REACHABILITY, null);
+
+        new android.os.Handler().postDelayed(
+            new Runnable() {
+                public void run() {
+                    instance.wakeUpAfterReachabilityTimeout(instance.currentConnectionRequest);
+                }
+            }, 2000);
     }
 
     private Boolean canMakeOutgoingCall() {
@@ -94,119 +243,50 @@ public class VoiceConnectionService extends ConnectionService {
     }
 
     private Connection createConnection(ConnectionRequest request) {
-        connection = new Connection() {
-            private boolean isMuted = false;
+        Bundle extras = request.getExtras();
+        HashMap<String, String> extrasMap = this.bundleToMap(extras);
+        extrasMap.put(EXTRA_CALL_NUMBER, request.getAddress().toString());
+        VoiceConnection connection = new VoiceConnection(this, extrasMap);
+        connection.setConnectionCapabilities(Connection.CAPABILITY_MUTE | Connection.CAPABILITY_SUPPORT_HOLD);
+        connection.setInitializing();
+        connection.setExtras(extras);
+        currentConnections.put(extras.getString(EXTRA_CALL_UUID), connection);
 
-            @Override
-            public void onCallAudioStateChanged(CallAudioState state) {
-                if (state.isMuted() == this.isMuted) {
-                    return;
-                }
-
-                this.isMuted = state.isMuted();
-
-                sendCallRequestToActivity(isMuted ? ACTION_MUTE_CALL : ACTION_UNMUTE_CALL, null);
+        // Get other connections for conferencing
+        Map<String, VoiceConnection> otherConnections = new HashMap<>();
+        for (Map.Entry<String, VoiceConnection> entry : currentConnections.entrySet()) {
+            if(!(extras.getString(EXTRA_CALL_UUID).equals(entry.getKey()))) {
+                otherConnections.put(entry.getKey(), entry.getValue());
             }
-
-            @Override
-            public void onAnswer() {
-                super.onAnswer();
-                Log.d(TAG, "onAnswer called");
-                if (connection == null) {
-                    return;
-                }
-
-                connection.setActive();
-                connection.setAudioModeIsVoip(true);
-
-                sendCallRequestToActivity(ACTION_ANSWER_CALL, null);
-                sendCallRequestToActivity(ACTION_AUDIO_SESSION, null);
-                Log.d(TAG, "onAnswer executed");
-            }
-
-            @Override
-            public void onPlayDtmfTone(char dtmf) {
-                sendCallRequestToActivity(ACTION_DTMF_TONE, String.valueOf(dtmf));
-            }
-
-            @Override
-            public void onDisconnect() {
-                super.onDisconnect();
-                Log.d(TAG, "onDisconnect called");
-                if (connection == null) {
-                    return;
-                }
-
-
-                connection.setDisconnected(new DisconnectCause(DisconnectCause.LOCAL));
-                connection.destroy();
-                connection = null;
-
-                sendCallRequestToActivity(ACTION_END_CALL, null);
-                Log.d(TAG, "onDisconnect executed");
-            }
-
-            @Override
-            public void onAbort() {
-                super.onAbort();
-                Log.d(TAG, "onAbort called");
-                if (connection == null) {
-                    return;
-                }
-
-                connection.setDisconnected(new DisconnectCause(DisconnectCause.CANCELED));
-                connection.destroy();
-
-                sendCallRequestToActivity(ACTION_END_CALL, null);
-                Log.d(TAG, "onAbort executed");
-            }
-
-            @Override
-            public void onHold() {
-                super.onHold();
-                connection.setOnHold();
-
-                sendCallRequestToActivity(ACTION_HOLD_CALL, null);
-            }
-
-            @Override
-            public void onUnhold() {
-                super.onUnhold();
-                connection.setActive();
-
-                sendCallRequestToActivity(ACTION_UNHOLD_CALL, null);
-            }
-
-            @Override
-            public void onReject() {
-                super.onReject();
-                Log.d(TAG, "onReject called");
-                if (connection == null) {
-                    return;
-                }
-
-                connection.setDisconnected(new DisconnectCause(DisconnectCause.CANCELED));
-                connection.destroy();
-
-                sendCallRequestToActivity(ACTION_END_CALL, null);
-                Log.d(TAG, "onReject executed");
-            }
-        };
-
-        Bundle extra = request.getExtras();
-
-        connection.setConnectionCapabilities(Connection.CAPABILITY_MUTE | Connection.CAPABILITY_HOLD | Connection.CAPABILITY_SUPPORT_HOLD);
-        connection.setAddress(request.getAddress(), TelecomManager.PRESENTATION_ALLOWED);
-        connection.setExtras(extra);
-        connection.setCallerDisplayName(extra.getString(EXTRA_CALLER_NAME), TelecomManager.PRESENTATION_ALLOWED);
+        }
+        List<Connection> conferenceConnections = new ArrayList<Connection>(otherConnections.values());
+        connection.setConferenceableConnections(conferenceConnections);
 
         return connection;
+    }
+
+    @Override
+    public void onConference(Connection connection1, Connection connection2) {
+        super.onConference(connection1, connection2);
+        VoiceConnection voiceConnection1 = (VoiceConnection) connection1;
+        VoiceConnection voiceConnection2 = (VoiceConnection) connection2;
+
+        PhoneAccountHandle phoneAccountHandle = RNCallKeepModule.handle;
+
+        VoiceConference voiceConference = new VoiceConference(handle);
+        voiceConference.addConnection(voiceConnection1);
+        voiceConference.addConnection(voiceConnection2);
+
+        connection1.onUnhold();
+        connection2.onUnhold();
+
+        this.addConference(voiceConference);
     }
 
     /*
      * Send call request to the RNCallKeepModule
      */
-    private void sendCallRequestToActivity(final String action, @Nullable final String attribute) {
+    private void sendCallRequestToActivity(final String action, @Nullable final HashMap attributeMap) {
         final VoiceConnectionService instance = this;
         final Handler handler = new Handler();
 
@@ -214,12 +294,45 @@ public class VoiceConnectionService extends ConnectionService {
             @Override
             public void run() {
                 Intent intent = new Intent(action);
-                if (attribute != null) {
-                    intent.putExtra("attribute", attribute);
+                if (attributeMap != null) {
+                    Bundle extras = new Bundle();
+                    extras.putSerializable("attributeMap", attributeMap);
+                    intent.putExtras(extras);
                 }
-
                 LocalBroadcastManager.getInstance(instance).sendBroadcast(intent);
             }
         });
+    }
+
+    private HashMap<String, String> bundleToMap(Bundle extras) {
+        HashMap<String, String> extrasMap = new HashMap<>();
+        Set<String> keySet = extras.keySet();
+        Iterator<String> iterator = keySet.iterator();
+
+        while(iterator.hasNext()) {
+            String key = iterator.next();
+            if (extras.get(key) != null) {
+                extrasMap.put(key, extras.get(key).toString());
+            }
+        }
+        return extrasMap;
+    }
+
+    /**
+     * https://stackoverflow.com/questions/5446565/android-how-do-i-check-if-activity-is-running
+     *
+     * @param context Context
+     * @return boolean
+     */
+    public static boolean isRunning(Context context) {
+        ActivityManager activityManager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+        List<RunningTaskInfo> tasks = activityManager.getRunningTasks(Integer.MAX_VALUE);
+
+        for (RunningTaskInfo task : tasks) {
+            if (context.getPackageName().equalsIgnoreCase(task.baseActivity.getPackageName()))
+                return true;
+        }
+
+        return false;
     }
 }

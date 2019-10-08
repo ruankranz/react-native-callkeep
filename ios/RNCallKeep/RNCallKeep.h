@@ -2,7 +2,7 @@
 //  RNCallKeep.h
 //  RNCallKeep
 //
-//  Copyright 2016-2018 The CallKeep Authors (see the AUTHORS file)
+//  Copyright 2016-2019 The CallKeep Authors (see the AUTHORS file)
 //  SPDX-License-Identifier: ISC, MIT
 //
 
@@ -27,4 +27,10 @@
 continueUserActivity:(NSUserActivity *)userActivity
   restorationHandler:(void(^)(NSArray * __nullable restorableObjects))restorationHandler;
 
++ (void)reportNewIncomingCall:(NSString *)uuidString
+                       handle:(NSString *)handle
+                   handleType:(NSString *)handleType
+                     hasVideo:(BOOL)hasVideo
+          localizedCallerName:(NSString * _Nullable)localizedCallerName
+                  fromPushKit:(BOOL)fromPushKit;
 @end
